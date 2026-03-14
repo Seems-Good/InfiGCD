@@ -6,7 +6,7 @@
 local ADDON_NAME, ns = ...
 local L = ns.L
 
-local ADDON_VERSION = "1.0.1"
+local ADDON_VERSION = "1.0.2"
 local REPO_URL      = "https://github.com/Seems-Good/InfiGCD"
 
 -- ---------------------------------------------------------------------------
