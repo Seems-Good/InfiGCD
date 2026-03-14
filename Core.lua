@@ -15,20 +15,12 @@ local L = ns.L  -- locale table populated by Locales/enUS.lua (or any override)
 -- Constants
 -- ---------------------------------------------------------------------------
 
-local GCD_SPELL_ID  = 61304   -- WoW's internal GCD spell; duration is haste-adjusted
+local GCD_SPELL_ID  = 61304
 local FRAME_SIZE    = 64
 local FADE_DURATION = 0.3
-local MAX_GCD       = 1.6     -- sanity cap; real CDs are longer than this
+local MAX_GCD       = 1.6
 local DEFAULT_X     = 0
 local DEFAULT_Y     = -120
-
--- Spell IDs that are NOT player-initiated abilities and must never trigger
--- the GCD display. Auto Shot and melee Auto Attack both fire SPELLCAST events
--- but consume no GCD -- showing their icon mid-cast is incorrect.
-local BLOCKED_SPELLS = {
-    [75]   = true,   -- Auto Shot (hunter ranged auto)
-    [6603] = true,   -- Auto Attack (melee swing)
-}
 
 -- ---------------------------------------------------------------------------
 -- SavedVariables defaults
@@ -42,23 +34,23 @@ local DB_DEFAULTS = {
 }
 
 -- ---------------------------------------------------------------------------
--- Cast / channel state tracking
+-- State
 --
--- isCasting:
---   Set to true on UNIT_SPELLCAST_START (a cast-time spell has begun).
---   The GCD is shown immediately on START. SUCCEEDED for the same cast fires
---   later when the cast finishes -- by then the GCD is already over, and we
---   must NOT process SUCCEEDED or we replace the icon with whatever fired last
---   (e.g. Auto Shot triggering during the cast window).
---   Cleared on SUCCEEDED, FAILED, or INTERRUPTED.
+-- isCasting / isChanneling: prevent SUCCEEDED from firing for cast-time spells
+-- and channel ticks as before.
 --
--- isChanneling:
---   Set to true on CHANNEL_START. Channels fire SUCCEEDED on every damage tick
---   which would reset the display. Cleared on CHANNEL_STOP.
+-- lastShownGCDStart: the GCD startTime of the last spell we displayed.
+--   Every GCD has a unique, monotonically-increasing startTime stamped by the
+--   server. A real new ability always brings a NEWER startTime than the one
+--   currently running. Auto Shot / Auto Attack fire SUCCEEDED while an existing
+--   GCD is still active -- their startTime is the same stale value from the
+--   ability that triggered the GCD. By only showing when startTime > lastShown
+--   we block all background autos with zero ID-based logic and no thresholds.
 -- ---------------------------------------------------------------------------
 
-local isCasting    = false
-local isChanneling = false
+local isCasting        = false
+local isChanneling     = false
+local lastShownGCDStart = 0
 
 -- ---------------------------------------------------------------------------
 -- Main display frame
@@ -73,9 +65,6 @@ frame:Hide()
 
 -- ---------------------------------------------------------------------------
 -- Circular mask
--- CreateMaskTexture + AddMaskTexture is the correct modern API.
--- Unlike SetMask it does NOT reset UV coordinates, so SetTexCoord works
--- alongside it cleanly.
 -- ---------------------------------------------------------------------------
 
 local circleMask = frame:CreateMaskTexture()
@@ -94,25 +83,19 @@ local iconTex = frame:CreateTexture(nil, "BACKGROUND")
 iconTex:SetAllPoints()
 iconTex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 iconTex:AddMaskTexture(circleMask)
-iconTex:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")  -- default until first cast
+iconTex:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
 
 -- ---------------------------------------------------------------------------
 -- Cooldown sweep frame
--- The CooldownFrameTemplate's swipe texture is created lazily by the C engine
--- the first time SetCooldown is called with a non-zero duration. We force that
--- initialisation immediately with a dummy call so GetRegions() can see the
--- texture and we can apply our circular mask to it -- eliminating the square
--- corner bleed on the dark sweep.
 -- ---------------------------------------------------------------------------
 
 local cd = CreateFrame("Cooldown", "InfiGCDCooldown", frame, "CooldownFrameTemplate")
 cd:SetAllPoints()
 cd:SetDrawSwipe(true)
-cd:SetDrawEdge(false)   -- edge line doesn't clip cleanly to a circle
-cd:SetDrawBling(false)  -- suppress sparkle; we fade instead
+cd:SetDrawEdge(false)
+cd:SetDrawBling(false)
 cd:SetSwipeColor(0, 0, 0, 0.8)
 
--- Force lazy texture initialisation, mask everything, then clear.
 cd:SetCooldown(GetTime(), 1)
 for _, region in ipairs({ cd:GetRegions() }) do
     if region.AddMaskTexture then
@@ -172,15 +155,20 @@ local function ShowSpellGCD(spellID)
     local spellIcon = C_Spell.GetSpellTexture(spellID)
     if not spellIcon then return end
 
-    -- Use GetTime() as the anchor rather than cdInfo.startTime.
-    -- If the same spell is recast while its GCD is still running, the engine
-    -- returns the original startTime and SetCooldown() ignores identical args.
-    -- GetTime() always forces the widget to start a fresh sweep.
-    local cdInfo = C_Spell.GetSpellCooldown(GCD_SPELL_ID)
-    local duration = cdInfo and cdInfo.duration
+    local cdInfo    = C_Spell.GetSpellCooldown(GCD_SPELL_ID)
+    local duration  = cdInfo and cdInfo.duration
+    local startTime = cdInfo and cdInfo.startTime
 
-    if not duration or duration == 0 then return end  -- off-GCD / expired
-    if duration > MAX_GCD then return end              -- real cooldown, skip
+    if not duration or duration == 0 then return end
+    if duration > MAX_GCD then return end
+
+    -- Core auto-attack filter: only show if this spell brought a NEW GCD.
+    -- Auto Shot / Auto Attack never start a GCD -- they fire SUCCEEDED while
+    -- an existing GCD (started by a real ability) is still running, so their
+    -- startTime is always equal to lastShownGCDStart. A real new ability always
+    -- stamps a fresh, larger startTime. No spell IDs or thresholds needed.
+    if startTime <= lastShownGCDStart then return end
+    lastShownGCDStart = startTime
 
     if fadeGroup:IsPlaying() then
         fadeGroup:Stop()
@@ -194,24 +182,18 @@ local function ShowSpellGCD(spellID)
 end
 
 -- ---------------------------------------------------------------------------
--- Event dispatcher  (no OnUpdate, no ticker, no polling)
+-- Event dispatcher
 -- ---------------------------------------------------------------------------
 
 local eventFrame = CreateFrame("Frame")
 
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("PLAYER_LOGOUT")
--- START: cast-time spell began. Show GCD immediately and mark isCasting.
 eventFrame:RegisterEvent("UNIT_SPELLCAST_START")
--- SUCCEEDED: true instants only -- skipped if isCasting or isChanneling.
--- Also used to clear the isCasting flag when a cast-time spell completes.
 eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
--- FAILED / INTERRUPTED: clear isCasting so the next instant works correctly.
 eventFrame:RegisterEvent("UNIT_SPELLCAST_FAILED")
 eventFrame:RegisterEvent("UNIT_SPELLCAST_INTERRUPTED")
--- CHANNEL_START: GCD is consumed here; show once and set isChanneling.
 eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_START")
--- CHANNEL_STOP: clear isChanneling so SUCCEEDED works for the next spell.
 eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_STOP")
 
 eventFrame:SetScript("OnEvent", function(_, event, ...)
@@ -242,22 +224,17 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
     elseif event == "UNIT_SPELLCAST_START" then
         local unit, _, spellID = ...
         if unit ~= "player" then return end
-        if BLOCKED_SPELLS[spellID] then return end
         isCasting = true
         ShowSpellGCD(spellID)
 
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         local unit, _, spellID = ...
         if unit ~= "player" then return end
-        if BLOCKED_SPELLS[spellID] then return end
         if isChanneling then return end
         if isCasting then
-            -- This is the completion of a cast-time spell whose GCD we already
-            -- showed on START. Do not re-trigger; just clear the cast flag.
             isCasting = false
             return
         end
-        -- No active cast means this is a true instant spell.
         ShowSpellGCD(spellID)
 
     elseif event == "UNIT_SPELLCAST_FAILED"
@@ -269,8 +246,8 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
     elseif event == "UNIT_SPELLCAST_CHANNEL_START" then
         local unit, _, spellID = ...
         if unit ~= "player" then return end
-        isCasting      = false
-        isChanneling   = true
+        isCasting    = false
+        isChanneling = true
         ShowSpellGCD(spellID)
 
     elseif event == "UNIT_SPELLCAST_CHANNEL_STOP" then
@@ -330,7 +307,7 @@ SlashCmdList["INFIGCD"] = function(msg)
 end
 
 -- ---------------------------------------------------------------------------
--- Public API exposed on the addon namespace for Settings.lua
+-- Public API for Settings.lua
 -- ---------------------------------------------------------------------------
 
 ns.DEFAULT_X = DEFAULT_X
@@ -339,11 +316,7 @@ ns.DEFAULT_Y = DEFAULT_Y
 function ns.SetLocked(locked)
     InfiGCDDB.locked = locked
     frame:EnableMouse(not locked)
-    if locked then
-        frame:Hide()
-    else
-        frame:Show()
-    end
+    if locked then frame:Hide() else frame:Show() end
 end
 
 function ns.SetScale(val)
@@ -352,9 +325,7 @@ function ns.SetScale(val)
 end
 
 function ns.ResetPosition()
-    InfiGCDDB.x     = DEFAULT_X
-    InfiGCDDB.y     = DEFAULT_Y
-    InfiGCDDB.scale = 1.0
+    InfiGCDDB.x, InfiGCDDB.y, InfiGCDDB.scale = DEFAULT_X, DEFAULT_Y, 1.0
     frame:ClearAllPoints()
     frame:SetPoint("CENTER", UIParent, "CENTER", DEFAULT_X, DEFAULT_Y)
     frame:SetScale(1.0)
