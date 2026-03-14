@@ -22,6 +22,14 @@ local MAX_GCD       = 1.6     -- sanity cap; real CDs are longer than this
 local DEFAULT_X     = 0
 local DEFAULT_Y     = -120
 
+-- Spell IDs that are NOT player-initiated abilities and must never trigger
+-- the GCD display. Auto Shot and melee Auto Attack both fire SPELLCAST events
+-- but consume no GCD -- showing their icon mid-cast is incorrect.
+local BLOCKED_SPELLS = {
+    [75]   = true,   -- Auto Shot (hunter ranged auto)
+    [6603] = true,   -- Auto Attack (melee swing)
+}
+
 -- ---------------------------------------------------------------------------
 -- SavedVariables defaults
 -- ---------------------------------------------------------------------------
@@ -34,13 +42,22 @@ local DB_DEFAULTS = {
 }
 
 -- ---------------------------------------------------------------------------
--- Channel state tracking
--- Disintegrate and other channels fire UNIT_SPELLCAST_SUCCEEDED for every
--- damage tick. We track whether the player is currently channeling and skip
--- SUCCEEDED events during that window -- we already showed the GCD on
--- CHANNEL_START, so ticks should never reset or restart the display.
+-- Cast / channel state tracking
+--
+-- isCasting:
+--   Set to true on UNIT_SPELLCAST_START (a cast-time spell has begun).
+--   The GCD is shown immediately on START. SUCCEEDED for the same cast fires
+--   later when the cast finishes -- by then the GCD is already over, and we
+--   must NOT process SUCCEEDED or we replace the icon with whatever fired last
+--   (e.g. Auto Shot triggering during the cast window).
+--   Cleared on SUCCEEDED, FAILED, or INTERRUPTED.
+--
+-- isChanneling:
+--   Set to true on CHANNEL_START. Channels fire SUCCEEDED on every damage tick
+--   which would reset the display. Cleared on CHANNEL_STOP.
 -- ---------------------------------------------------------------------------
 
+local isCasting    = false
 local isChanneling = false
 
 -- ---------------------------------------------------------------------------
@@ -184,14 +201,17 @@ local eventFrame = CreateFrame("Frame")
 
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("PLAYER_LOGOUT")
--- START fires at button press for cast-time spells; GCD is live here.
+-- START: cast-time spell began. Show GCD immediately and mark isCasting.
 eventFrame:RegisterEvent("UNIT_SPELLCAST_START")
--- SUCCEEDED fires for instant spells (no START fires for instants).
--- Also fires per-tick for channels -- skipped via isChanneling guard.
+-- SUCCEEDED: true instants only -- skipped if isCasting or isChanneling.
+-- Also used to clear the isCasting flag when a cast-time spell completes.
 eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
--- CHANNEL_START: GCD is consumed here; we show it once and set the flag.
+-- FAILED / INTERRUPTED: clear isCasting so the next instant works correctly.
+eventFrame:RegisterEvent("UNIT_SPELLCAST_FAILED")
+eventFrame:RegisterEvent("UNIT_SPELLCAST_INTERRUPTED")
+-- CHANNEL_START: GCD is consumed here; show once and set isChanneling.
 eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_START")
--- CHANNEL_STOP: clear the channeling flag so SUCCEEDED works again.
+-- CHANNEL_STOP: clear isChanneling so SUCCEEDED works for the next spell.
 eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_STOP")
 
 eventFrame:SetScript("OnEvent", function(_, event, ...)
@@ -219,24 +239,44 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
             if y then InfiGCDDB.y = y end
         end
 
+    elseif event == "UNIT_SPELLCAST_START" then
+        local unit, _, spellID = ...
+        if unit ~= "player" then return end
+        if BLOCKED_SPELLS[spellID] then return end
+        isCasting = true
+        ShowSpellGCD(spellID)
+
+    elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
+        local unit, _, spellID = ...
+        if unit ~= "player" then return end
+        if BLOCKED_SPELLS[spellID] then return end
+        if isChanneling then return end
+        if isCasting then
+            -- This is the completion of a cast-time spell whose GCD we already
+            -- showed on START. Do not re-trigger; just clear the cast flag.
+            isCasting = false
+            return
+        end
+        -- No active cast means this is a true instant spell.
+        ShowSpellGCD(spellID)
+
+    elseif event == "UNIT_SPELLCAST_FAILED"
+        or event == "UNIT_SPELLCAST_INTERRUPTED" then
+        local unit = ...
+        if unit ~= "player" then return end
+        isCasting = false
+
     elseif event == "UNIT_SPELLCAST_CHANNEL_START" then
         local unit, _, spellID = ...
         if unit ~= "player" then return end
-        isChanneling = true
+        isCasting      = false
+        isChanneling   = true
         ShowSpellGCD(spellID)
 
     elseif event == "UNIT_SPELLCAST_CHANNEL_STOP" then
         local unit = ...
         if unit ~= "player" then return end
         isChanneling = false
-
-    elseif event == "UNIT_SPELLCAST_START"
-        or event == "UNIT_SPELLCAST_SUCCEEDED" then
-        local unit, _, spellID = ...
-        if unit ~= "player" then return end
-        -- Skip per-tick SUCCEEDED events that fire during an active channel.
-        if isChanneling then return end
-        ShowSpellGCD(spellID)
     end
 end)
 
@@ -288,6 +328,7 @@ SlashCmdList["INFIGCD"] = function(msg)
         print("  |cffffff00/infigcd reset|r  -- " .. L.HELP_RESET)
     end
 end
+
 -- ---------------------------------------------------------------------------
 -- Public API exposed on the addon namespace for Settings.lua
 -- ---------------------------------------------------------------------------
