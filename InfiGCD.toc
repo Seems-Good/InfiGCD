@@ -1,0 +1,10 @@
+## Interface: 120000, 120001
+## Version: 1.0.0
+## Title: |cff00ccffInfi|rGCD
+## Note: Track and Display GCD with Last Pressed Ability 
+## Author: Jeremy-Gstein 
+## SavedVariables: InfiGCDDB
+
+Locale/enUS.lua
+Core.lua
+Settings.lua
