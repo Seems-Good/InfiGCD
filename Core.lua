@@ -27,10 +27,11 @@ local DEFAULT_Y     = -120
 -- ---------------------------------------------------------------------------
 
 local DB_DEFAULTS = {
-    x      = DEFAULT_X,
-    y      = DEFAULT_Y,
-    scale  = 1.0,
-    locked = true,
+    x           = DEFAULT_X,
+    y           = DEFAULT_Y,
+    scale       = 1.0,
+    locked      = true,
+    instantOnly = false,  -- when true, cast-time spells are silently skipped
 }
 
 -- ---------------------------------------------------------------------------
@@ -225,7 +226,11 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         local unit, _, spellID = ...
         if unit ~= "player" then return end
         isCasting = true
-        ShowSpellGCD(spellID)
+        -- When instantOnly is on we still track the cast state so the
+        -- SUCCEEDED handler knows not to re-fire, but we don't show the GCD.
+        if not InfiGCDDB.instantOnly then
+            ShowSpellGCD(spellID)
+        end
 
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         local unit, _, spellID = ...
@@ -329,4 +334,8 @@ function ns.ResetPosition()
     frame:ClearAllPoints()
     frame:SetPoint("CENTER", UIParent, "CENTER", DEFAULT_X, DEFAULT_Y)
     frame:SetScale(1.0)
+end
+
+function ns.SetInstantOnly(val)
+    InfiGCDDB.instantOnly = val
 end
